@@ -1,0 +1,134 @@
+# python
+import os
+import unittest
+import types
+from datetime import datetime
+
+# Ensure environment variables expected by the module are present before import
+os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
+os.environ.setdefault('DB_NAME', 'testdb')
+os.environ.setdefault('CORS_ORIGINS', '*')
+
+# Absolute import of the module under test
+import importlib
+backend = importlib.import_module('recipi_app.backend')
+
+# Fake async collection and cursor to avoid real MongoDB usage
+class FakeCursor:
+    def __init__(self, stored):
+        self._stored = stored
+
+    async def to_list(self, limit):
+        # ignore limit for tests
+        return list(self._stored)
+
+class FakeCollection:
+    def __init__(self, initial=None):
+        self._stored = list(initial or [])
+
+    async def insert_one(self, doc):
+        # emulate motor's InsertOneResult-ish object minimally
+        self._stored.append(doc)
+        class R: inserted_id = doc.get('id', None)
+        return R()
+
+    def find(self):
+        return FakeCursor(self._stored)
+
+class FakeDB:
+    def __init__(self, initial=None, recipes_initial=None):
+        self.status_checks = FakeCollection(initial)
+        self.recipes = FakeCollection(recipes_initial or [])
+
+    def add_default_recipes(self):
+        import uuid
+        now = datetime.utcnow()
+        self.recipes._stored.extend([
+            {
+                'id': str(uuid.uuid4()),
+                'title': 'Pancakes',
+                'ingredients': ['flour', 'milk', 'egg'],
+                'steps': ['mix', 'cook'],
+                'created_at': now
+            },
+            {
+                'id': str(uuid.uuid4()),
+                'title': 'Tomato Soup',
+                'ingredients': ['tomato', 'water', 'salt'],
+                'steps': ['blend', 'heat'],
+                'created_at': now
+            },
+            {
+                'id': str(uuid.uuid4()),
+                'title': 'Grilled Cheese',
+                'ingredients': ['bread', 'cheese', 'butter'],
+                'steps': ['assemble', 'grill'],
+                'created_at': now
+            },
+        ])
+
+class TestBackend(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # Save original db and replace with fake
+        self._orig_db = backend.db
+        backend.db = FakeDB()
+
+    async def asyncTearDown(self):
+        # Restore original db
+        backend.db = self._orig_db
+
+    async def test_root_returns_hello_world(self):
+        res = await backend.root()
+        self.assertEqual(res, {"message": "Hello World"})
+
+    async def test_create_status_check_inserts_and_returns_model(self):
+        # Create input model using module's Pydantic model
+        input_model = backend.StatusCheckCreate(client_name="tester")
+        result = await backend.create_status_check(input_model)
+
+        # Assert returned is a StatusCheck instance with expected data
+        self.assertIsInstance(result, backend.StatusCheck)
+        self.assertEqual(result.client_name, "tester")
+        # Check that a document was inserted into the fake DB
+        stored = backend.db.status_checks._stored
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]['client_name'], "tester")
+        # inserted document should contain id and timestamp (defaults from model)
+        self.assertIn('id', stored[0])
+        self.assertIn('timestamp', stored[0])
+        # ensure id is a str and timestamp is a datetime or pydantic-compatible type
+        self.assertIsInstance(stored[0]['id'], str)
+
+    async def test_get_status_checks_returns_statuscheck_list(self):
+        # prepare a stored document (use datetime object for timestamp)
+        sample = {
+            'id': 'abc-123',
+            'client_name': 'alice',
+            'timestamp': datetime.utcnow()
+        }
+        # replace fake DB with one pre-populated
+        backend.db = FakeDB(initial=[sample])
+
+        res_list = await backend.get_status_checks()
+        self.assertIsInstance(res_list, list)
+        self.assertEqual(len(res_list), 1)
+        item = res_list[0]
+        self.assertIsInstance(item, backend.StatusCheck)
+        self.assertEqual(item.id, 'abc-123')
+        self.assertEqual(item.client_name, 'alice')
+        # timestamp should be a datetime
+        self.assertIsInstance(item.timestamp, datetime)
+
+    async def test_fake_recipes_added_and_accessible(self):
+        # Use fake DB and populate default fake recipes
+        backend.db = FakeDB()
+        backend.db.add_default_recipes()
+        stored = backend.db.recipes._stored
+        self.assertGreaterEqual(len(stored), 3)
+        titles = [r['title'] for r in stored]
+        self.assertIn('Pancakes', titles)
+        self.assertIn('Tomato Soup', titles)
+        self.assertIn('Grilled Cheese', titles)
+
+if __name__ == '__main__':
+    unittest.main()
